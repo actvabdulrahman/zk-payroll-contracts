@@ -284,6 +284,29 @@ pub struct RunReview {
     pub reviewed_at: u64,
 }
 
+/// Result of removing a stale approval record (#548).
+///
+/// Deliberately carries no reviewer address and no payroll amounts: the record
+/// type is enough for an operator or indexer to reconcile the cleanup.
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaleApprovalCleanupResult {
+    pub run_id: u64,
+    pub removed: bool,
+    pub reviewed_at: u64,
+    pub expired_at: u64,
+}
+
+/// Read-only staleness assessment for a payroll run's approval (#548).
+#[contracttype]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StaleApprovalStatus {
+    pub run_id: u64,
+    pub is_stale: bool,
+    pub reviewed_at: u64,
+    pub expires_at: u64,
+}
+
 // ── Issue #342: dispute freeze/thaw controls ─────────────────────────────────
 
 /// Lifecycle status of a payroll dispute.
@@ -7506,6 +7529,116 @@ impl Payroll {
         if Self::is_payroll_approval_expired(e.clone(), run_id, max_age_seconds) {
             panic!("Payroll approval expired: approval record exceeds maximum allowed age");
         }
+    }
+
+    // ?? Issue #548: Stale Approval Cleanup ??????????????????????????????????????
+
+    /// Permanently remove an expired approval record for a single payroll run
+    /// (#548).
+    ///
+    /// An approval is *stale* when it is an `Approved` decision whose
+    /// `reviewed_at` is older than `max_age_seconds` — exactly the condition
+    /// `is_payroll_approval_expired` reports. Removing it is safe because
+    /// `finalize_payroll_run` already refuses to settle an expired approval, so
+    /// a stale record can never authorize a payout: this only reclaims the
+    /// ledger entry it occupies. An approval that is still inside its validity
+    /// window is left untouched.
+    ///
+    /// Records with a `Rejected` or `ChangesRequested` decision are never
+    /// stale under this definition and are never removed, so cleanup cannot
+    /// erase a reviewer's non-approval decision.
+    ///
+    /// `run_id` must be supplied explicitly because `RunReview` is keyed only by
+    /// `run_id` with no enumerable index; a sweep over all approvals is not
+    /// possible in bounded contract execution. Callers should drive this from
+    /// their own run index (for example the finalized/archived run set).
+    ///
+    /// # Panics
+    /// - `"Unauthorized"` if `admin` is not the registered payroll admin.
+    /// - `"No approval exists for this payroll run"` if there is no review.
+    /// - `"Record is not an approval: nothing stale to clean up"` if the
+    ///   review is a `Rejected` or `ChangesRequested` decision.
+    /// - `"Approval is not stale: still within its validity window"` if the
+    ///   approval has not yet expired.
+    ///
+    /// The returned struct and the emitted event carry only the `run_id`, the
+    /// review timestamp, and the record type. No reviewer address, salary,
+    /// employee count, or other payroll value is disclosed.
+    pub fn cleanup_stale_approval(
+        e: Env,
+        admin: Address,
+        run_id: u64,
+        max_age_seconds: u64,
+    ) -> StaleApprovalCleanupResult {
+        Self::require_not_paused(&e);
+        Self::validate_run_id(run_id);
+
+        let addrs: ContractAddresses = e
+            .storage()
+            .persistent()
+            .get(&DataKey::Addresses)
+            .expect("Not initialized");
+        if admin != addrs.admin {
+            panic!("Unauthorized");
+        }
+        admin.require_auth();
+
+        let review: RunReview = e
+            .storage()
+            .persistent()
+            .get(&DataKey::RunReview(run_id))
+            .expect("No approval exists for this payroll run");
+
+        // Reuse the single definition of staleness so cleanup and the
+        // finalize-time guard can never disagree about the cutoff.
+        if review.decision != ReviewDecision::Approved {
+            panic!("Record is not an approval: nothing stale to clean up");
+        }
+        let expiry_time = review.reviewed_at.saturating_add(max_age_seconds);
+        if e.ledger().timestamp() <= expiry_time {
+            panic!("Approval is not stale: still within its validity window");
+        }
+
+        e.storage().persistent().remove(&DataKey::RunReview(run_id));
+
+        // Reuse the existing retention-prune event; `record_type` identifies
+        // the kind of record without naming the reviewer.
+        payroll_events::emit_retention_pruned(
+            &e,
+            Symbol::new(&e, "run_approval"),
+            run_id,
+            admin.clone(),
+        );
+
+        StaleApprovalCleanupResult {
+            run_id,
+            removed: true,
+            reviewed_at: review.reviewed_at,
+            expired_at: expiry_time,
+        }
+    }
+
+    /// Read-only preview of whether a payroll run holds a stale approval (#548).
+    ///
+    /// Returns `None` when no review exists. The result is safe to log: it
+    /// exposes no reviewer identity and no payroll amounts.
+    pub fn get_stale_approval_status(
+        e: Env,
+        run_id: u64,
+        max_age_seconds: u64,
+    ) -> Option<StaleApprovalStatus> {
+        Self::validate_run_id(run_id);
+        let review: RunReview = e.storage().persistent().get(&DataKey::RunReview(run_id))?;
+        if review.decision != ReviewDecision::Approved {
+            return None;
+        }
+        let expiry_time = review.reviewed_at.saturating_add(max_age_seconds);
+        Some(StaleApprovalStatus {
+            run_id,
+            is_stale: e.ledger().timestamp() > expiry_time,
+            reviewed_at: review.reviewed_at,
+            expires_at: expiry_time,
+        })
     }
 
     // ?? Issue #404: Cancelled Batch Read Status Helper ???????????????????????
